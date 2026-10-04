@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""
+omarchy-calendar-sync
+Lightweight, resilient calendar sync daemon and notification dispatcher for Omarchy.
+Syncs online .ics subscriptions (Google Calendar, WebCal, etc.) to local cache
+and triggers native desktop notifications for upcoming events.
+"""
+
+import sys
+import os
+import re
+import json
+import time
+import argparse
+import subprocess
+from datetime import datetime, date, time as dtime, timedelta
+from zoneinfo import ZoneInfo
+import urllib.request
+import urllib.error
+
+CONFIG_PATH = os.path.expanduser("~/.config/omarchy/calendars.json")
+CACHE_DIR = os.path.expanduser("~/.cache/omarchy")
+CACHE_FILE = os.path.join(CACHE_DIR, "calendar_events.json")
+NOTIFIED_FILE = os.path.join(CACHE_DIR, "calendar_notified.json")
+
+DEFAULT_CONFIG = [
+    {
+        "name": "Google 日历",
+        "url": "",
+        "color": "#4285F4"
+    }
+]
+
+def ensure_config():
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+
+def get_local_tz():
+    try:
+        # Check /etc/localtime or local system timezone
+        return datetime.now().astimezone().tzinfo
+    except Exception:
+        return ZoneInfo("UTC")
+
+def unfold_ics_lines(raw_text):
+    """RFC 5545 unfolding: unfold lines beginning with space or tab."""
+    lines = raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    unfolded = []
+    for line in lines:
+        if (line.startswith(" ") or line.startswith("\t")) and unfolded:
+            unfolded[-1] += line[1:]
+        else:
+            unfolded.append(line)
+    return unfolded
+
+def parse_ics_datetime(value, params, local_tz):
+    """
+    Parse an iCalendar DATE or DATE-TIME value into an aware datetime object.
+    Returns (dt_aware, is_all_day).
+    """
+    val = value.strip()
+    is_all_day = False
+
+    # Check params for VALUE=DATE or string format YYYYMMDD
+    if "VALUE=DATE" in params.upper() or (len(val) == 8 and val.isdigit()):
+        is_all_day = True
+        try:
+            d = datetime.strptime(val[:8], "%Y%m%d").date()
+            dt = datetime.combine(d, dtime(0, 0)).replace(tzinfo=local_tz)
+            return dt, True
+        except Exception:
+            pass
+
+    # Clean string if formatted like 20261001T150000Z
+    tz = local_tz
+    if val.endswith("Z"):
+        tz = ZoneInfo("UTC")
+        val = val[:-1]
+    else:
+        # Look for TZID in params
+        m = re.search(r'TZID=([^;:]+)', params, re.IGNORECASE)
+        if m:
+            tz_str = m.group(1).strip('"\'')
+            try:
+                tz = ZoneInfo(tz_str)
+            except Exception:
+                tz = local_tz
+
+    try:
+        # Expected format: YYYYMMDDTHHMMSS
+        if "T" in val:
+            parts = val.split("T")
+            d_part = parts[0]
+            t_part = parts[1][:6] # ignore fractional seconds if any
+            dt_naive = datetime.strptime(f"{d_part}T{t_part}", "%Y%m%dT%H%M%S")
+            dt_aware = dt_naive.replace(tzinfo=tz)
+            return dt_aware.astimezone(local_tz), False
+    except Exception:
+        pass
+
+    # Fallback try 8 chars date
+    try:
+        d = datetime.strptime(val[:8], "%Y%m%d").date()
+        return datetime.combine(d, dtime(0, 0)).replace(tzinfo=local_tz), True
+    except Exception:
+        return datetime.now(local_tz), False
+
+def unescape_ics_text(text):
+    if not text:
+        return ""
+    return text.replace(r"\,", ",").replace(r"\;", ";").replace(r"\n", "\n").replace(r"\N", "\n").replace(r"\\", "\\")
+
+def parse_rrule(rrule_str):
+    parts = rrule_str.split(";")
+    rule = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            rule[k.upper()] = v
+    return rule
+
+def expand_rrule(start_dt, end_dt, is_all_day, rrule_str, window_start, window_end, local_tz):
+    """Expand simple RRULEs within [window_start, window_end]"""
+    occurrences = []
+    if not rrule_str:
+        if end_dt >= window_start and start_dt <= window_end:
+            occurrences.append((start_dt, end_dt))
+        return occurrences
+
+    rule = parse_rrule(rrule_str)
+    freq = rule.get("FREQ", "").upper()
+    interval = max(1, int(rule.get("INTERVAL", 1)))
+
+    until_dt = None
+    if "UNTIL" in rule:
+        until_dt, _ = parse_ics_datetime(rule["UNTIL"], "", local_tz)
+        if until_dt < window_start:
+            return occurrences
+
+    has_count = "COUNT" in rule
+    count = int(rule["COUNT"]) if has_count else None
+
+    # Check if a finite series with COUNT finished in the past
+    if count is not None:
+        if count <= 0:
+            return occurrences
+        if freq == "DAILY":
+            last_start = start_dt + timedelta(days=(count - 1) * interval)
+            if last_start < window_start:
+                return occurrences
+        elif freq == "WEEKLY":
+            last_start = start_dt + timedelta(weeks=(count - 1) * interval)
+            if last_start < window_start:
+                return occurrences
+        elif freq == "YEARLY":
+            last_year = start_dt.year + (count - 1) * interval
+            try:
+                last_start = start_dt.replace(year=last_year)
+            except ValueError:
+                last_start = start_dt.replace(year=last_year, day=28)
+            if last_start < window_start:
+                return occurrences
+        elif freq == "MONTHLY":
+            total_m = (count - 1) * interval
+            last_year = start_dt.year + (start_dt.month + total_m - 1) // 12
+            last_month = (start_dt.month + total_m - 1) % 12 + 1
+            last_day = min(start_dt.day, 28)
+            last_start = start_dt.replace(year=last_year, month=last_month, day=last_day)
+            if last_start < window_start:
+                return occurrences
+
+    duration = end_dt - start_dt
+    cur_start = start_dt
+    generated = 0
+
+    # Fast forward series that recur into the future if starting far in the past
+    if cur_start < window_start:
+        if freq == "DAILY":
+            skip = (window_start - cur_start).days // interval
+            if skip > 0:
+                cur_start += timedelta(days=skip * interval)
+                generated += skip
+        elif freq == "WEEKLY":
+            skip = ((window_start - cur_start).days // 7) // interval
+            if skip > 0:
+                cur_start += timedelta(weeks=skip * interval)
+                generated += skip
+        elif freq == "YEARLY":
+            skip = (window_start.year - cur_start.year) // interval
+            if skip > 0:
+                try:
+                    cur_start = cur_start.replace(year=cur_start.year + skip * interval)
+                except ValueError:
+                    cur_start = cur_start.replace(year=cur_start.year + skip * interval, day=28)
+                generated += skip
+        elif freq == "MONTHLY":
+            m_behind = (window_start.year - cur_start.year) * 12 + (window_start.month - cur_start.month)
+            skip = m_behind // interval
+            if skip > 0:
+                new_year = cur_start.year + (cur_start.month + skip * interval - 1) // 12
+                new_month = (cur_start.month + skip * interval - 1) % 12 + 1
+                new_day = min(start_dt.day, 28)
+                cur_start = cur_start.replace(year=new_year, month=new_month, day=new_day)
+                generated += skip
+
+    max_loops = 500
+    loops = 0
+
+    while cur_start <= window_end and loops < max_loops:
+        loops += 1
+        if count is not None and generated >= count:
+            break
+        if until_dt and cur_start > until_dt:
+            break
+
+        if (cur_start + duration) >= window_start and cur_start <= window_end:
+            occurrences.append((cur_start, cur_start + duration))
+
+        generated += 1
+
+        # Advance
+        if freq == "DAILY":
+            cur_start += timedelta(days=interval)
+        elif freq == "WEEKLY":
+            cur_start += timedelta(weeks=interval)
+        elif freq == "MONTHLY":
+            nxt_m = cur_start.month + interval - 1
+            year = cur_start.year + nxt_m // 12
+            month = nxt_m % 12 + 1
+            day = min(start_dt.day, 28)
+            cur_start = cur_start.replace(year=year, month=month, day=day)
+        elif freq == "YEARLY":
+            try:
+                cur_start = cur_start.replace(year=cur_start.year + interval)
+            except ValueError:
+                cur_start = cur_start.replace(year=cur_start.year + interval, day=28)
+        else:
+            break
+
+    return occurrences
+
+def parse_ics_content(raw_text, cal_name, cal_color, local_tz, window_days=30):
+    lines = unfold_ics_lines(raw_text)
+    events = []
+    in_event = False
+    cur = {}
+    now = datetime.now(local_tz)
+    window_start = now - timedelta(days=1)
+    window_end = now + timedelta(days=window_days)
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line == "BEGIN:VEVENT":
+            in_event = True
+            cur = {
+                "summary": "",
+                "location": "",
+                "description": "",
+                "dtstart": None,
+                "dtstart_params": "",
+                "dtend": None,
+                "dtend_params": "",
+                "duration": None,
+                "rrule": None,
+                "status": "CONFIRMED",
+                "uid": ""
+            }
+            continue
+        if line == "END:VEVENT":
+            in_event = False
+            if not cur.get("dtstart"):
+                continue
+            if cur.get("status", "").upper() == "CANCELLED":
+                continue
+
+            dtstart, is_all_day = parse_ics_datetime(cur["dtstart"], cur.get("dtstart_params", ""), local_tz)
+            if cur.get("dtend"):
+                dtend, _ = parse_ics_datetime(cur["dtend"], cur.get("dtend_params", ""), local_tz)
+            elif cur.get("duration"):
+                # Simple duration parse
+                dtend = dtstart + timedelta(hours=1)
+            else:
+                dtend = dtstart + (timedelta(days=1) if is_all_day else timedelta(hours=1))
+
+            # Expand occurrences
+            occurrences = expand_rrule(dtstart, dtend, is_all_day, cur.get("rrule"), window_start, window_end, local_tz)
+            for idx, (occ_start, occ_end) in enumerate(occurrences):
+                occ_id = f"{cur.get('uid', 'ev')}_{int(occ_start.timestamp())}"
+                events.append({
+                    "id": occ_id,
+                    "calendar": cal_name,
+                    "color": cal_color,
+                    "summary": unescape_ics_text(cur.get("summary", "无标题日程")) or "无标题日程",
+                    "location": unescape_ics_text(cur.get("location", "")),
+                    "description": unescape_ics_text(cur.get("description", "")),
+                    "start": occ_start.isoformat(),
+                    "end": occ_end.isoformat(),
+                    "startTimestamp": int(occ_start.timestamp()),
+                    "endTimestamp": int(occ_end.timestamp()),
+                    "allDay": is_all_day
+                })
+            continue
+
+        if not in_event:
+            continue
+
+        # Property parsing
+        if ":" in line:
+            left, value = line.split(":", 1)
+            prop_parts = left.split(";")
+            prop_name = prop_parts[0].upper()
+            params = ";".join(prop_parts[1:]) if len(prop_parts) > 1 else ""
+
+            if prop_name == "SUMMARY":
+                cur["summary"] = value
+            elif prop_name == "LOCATION":
+                cur["location"] = value
+            elif prop_name == "DESCRIPTION":
+                cur["description"] = value
+            elif prop_name == "UID":
+                cur["uid"] = value
+            elif prop_name == "STATUS":
+                cur["status"] = value
+            elif prop_name == "DTSTART":
+                cur["dtstart"] = value
+                cur["dtstart_params"] = params
+            elif prop_name == "DTEND":
+                cur["dtend"] = value
+                cur["dtend_params"] = params
+            elif prop_name == "RRULE":
+                cur["rrule"] = value
+
+    return events
+
+def fetch_url(url):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="replace")
+
+def sync_calendars():
+    ensure_config()
+    local_tz = get_local_tz()
+    now = datetime.now(local_tz)
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            calendars = json.load(f)
+    except Exception as e:
+        calendars = []
+
+    all_events = []
+    synced_cals = []
+
+    for item in calendars:
+        name = item.get("name", "未命名日历")
+        url = item.get("url", "").strip()
+        color = item.get("color", "#4285F4")
+
+        if not url:
+            continue
+
+        try:
+            fetch_target = url
+            if fetch_target.startswith("//"):
+                fetch_target = "https:" + fetch_target
+            elif fetch_target.startswith("webcal://"):
+                fetch_target = "https://" + fetch_target[9:]
+
+            if fetch_target.startswith("http://") or fetch_target.startswith("https://"):
+                raw_ics = fetch_url(fetch_target)
+            elif os.path.exists(os.path.expanduser(url)):
+                with open(os.path.expanduser(url), "r", encoding="utf-8", errors="replace") as lf:
+                    raw_ics = lf.read()
+            else:
+                print(f"[omarchy-calendar-sync] Warning: 无法识别的日历地址或路径: {url}", file=sys.stderr)
+                continue
+
+            if "<html" in raw_ics.lower() or "<!doctype html" in raw_ics.lower():
+                print(f"[omarchy-calendar-sync] 错误: 【{name}】 返回的是网页 HTML 页面，而非 .ics 日历数据！\n  -> 请检查链接是否填成了网页分享链接。Google 日历请使用 'iCal 格式的私密地址'。", file=sys.stderr)
+                continue
+
+            events = parse_ics_content(raw_ics, name, color, local_tz)
+            all_events.extend(events)
+            synced_cals.append(name)
+        except Exception as e:
+            print(f"[omarchy-calendar-sync] Warning: failed to sync {name}: {e}", file=sys.stderr)
+
+    # Sort all events by start time
+    all_events.sort(key=lambda x: x["startTimestamp"])
+
+    # Decorate with relativeDay and displayTime
+    today_date = now.date()
+    tomorrow_date = today_date + timedelta(days=1)
+
+    for ev in all_events:
+        st = datetime.fromtimestamp(ev["startTimestamp"], local_tz)
+        et = datetime.fromtimestamp(ev["endTimestamp"], local_tz)
+
+        ev_start_date = st.date()
+        if ev.get("allDay", False) and et > st:
+            ev_end_date = (et - timedelta(seconds=1)).date()
+        else:
+            ev_end_date = et.date()
+
+        days_from_today = (ev_start_date - today_date).days
+        ev["daysFromToday"] = days_from_today
+
+        if ev_end_date < today_date:
+            ev["relativeDay"] = "past"
+        elif ev_start_date <= today_date <= ev_end_date:
+            ev["relativeDay"] = "today"
+        elif ev_start_date == tomorrow_date:
+            ev["relativeDay"] = "tomorrow"
+        else:
+            ev["relativeDay"] = "upcoming"
+
+        # Format displayTime
+        if ev.get("allDay", False):
+            if ev_start_date == ev_end_date:
+                ev["displayTime"] = "全天"
+            else:
+                ev["displayTime"] = f"全天 ({st.strftime('%m/%d')} ~ {ev_end_date.strftime('%m/%d')})"
+        else:
+            if ev_start_date == et.date():
+                ev["displayTime"] = f"{st.strftime('%H:%M')} - {et.strftime('%H:%M')}"
+            else:
+                ev["displayTime"] = f"{st.strftime('%m/%d %H:%M')} - {et.strftime('%m/%d %H:%M')}"
+
+        ev["startDateStr"] = st.strftime("%Y-%m-%d")
+        ev["dateHeader"] = st.strftime("%m月%d日 %A")
+
+    # Filter out events that ended more than 4 hours ago
+    cutoff_ts = int((now - timedelta(hours=4)).timestamp())
+    valid_events = [ev for ev in all_events if ev["endTimestamp"] >= cutoff_ts]
+
+    # Write cache
+    result = {
+        "lastSync": now.isoformat(),
+        "lastSyncFormatted": now.strftime("%H:%M"),
+        "calendars": synced_cals,
+        "total": len(valid_events),
+        "events": valid_events
+    }
+
+    with open(CACHE_FILE + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    os.replace(CACHE_FILE + ".tmp", CACHE_FILE)
+
+    return result
+
+def check_and_send_notifications():
+    if not os.path.exists(CACHE_FILE):
+        return
+
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+
+    local_tz = get_local_tz()
+    now = datetime.now(local_tz)
+    now_ts = int(now.timestamp())
+
+    notified = {}
+    if os.path.exists(NOTIFIED_FILE):
+        try:
+            with open(NOTIFIED_FILE, "r", encoding="utf-8") as f:
+                notified = json.load(f)
+        except Exception:
+            notified = {}
+
+    changed = False
+
+    for ev in data.get("events", []):
+        if ev.get("allDay", False):
+            continue
+
+        ev_id = ev["id"]
+        start_ts = ev["startTimestamp"]
+        summary = ev["summary"]
+        location = ev.get("location", "")
+        display_time = ev.get("displayTime", "")
+
+        diff_seconds = start_ts - now_ts
+        diff_minutes = round(diff_seconds / 60)
+
+        ev_notified = notified.get(ev_id, [])
+
+        # 1. 提前 15 分钟提醒 (窗口: 13 ~ 16 分钟)
+        if 13 <= diff_minutes <= 16 and "15m" not in ev_notified:
+            loc_str = f" · {location}" if location else ""
+            desc = f"将在 {diff_minutes} 分钟后开始 ({display_time}){loc_str}"
+            send_notification(summary, desc)
+            ev_notified.append("15m")
+            notified[ev_id] = ev_notified
+            changed = True
+
+        # 2. 开始时提醒 (窗口: -1 ~ 2 分钟)
+        elif -1 <= diff_minutes <= 2 and "0m" not in ev_notified:
+            loc_str = f" · {location}" if location else ""
+            desc = f"日程现在开始 ({display_time}){loc_str}"
+            send_notification(summary, desc)
+            ev_notified.append("0m")
+            notified[ev_id] = ev_notified
+            changed = True
+
+    # Prune old notified keys (> 48h)
+    cutoff = now_ts - 172800
+    pruned = {k: v for k, v in notified.items() if int(k.split("_")[-1]) if k.split("_")[-1].isdigit() and int(k.split("_")[-1]) > cutoff}
+
+    if changed or len(pruned) != len(notified):
+        try:
+            with open(NOTIFIED_FILE, "w", encoding="utf-8") as f:
+                json.dump(notified, f)
+        except Exception:
+            pass
+
+def send_notification(title, desc):
+    try:
+        subprocess.run(
+            ["omarchy", "notification", "send", "-g", "󰃭", "--app-name", "日历", title, desc],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5
+        )
+    except Exception as e:
+        print(f"[omarchy-calendar-sync] Failed to send notification: {e}", file=sys.stderr)
+
+def run_daemon():
+    print("[omarchy-calendar-sync] Starting calendar sync daemon...")
+    last_sync_time = 0
+    sync_interval = 900  # 15 minutes
+
+    while True:
+        current_time = time.time()
+        if current_time - last_sync_time >= sync_interval:
+            try:
+                sync_calendars()
+                last_sync_time = current_time
+            except Exception as e:
+                print(f"[omarchy-calendar-sync] Sync error: {e}", file=sys.stderr)
+
+        try:
+            check_and_send_notifications()
+        except Exception as e:
+            print(f"[omarchy-calendar-sync] Notification check error: {e}", file=sys.stderr)
+
+        time.sleep(30)
+
+def main():
+    parser = argparse.ArgumentParser(description="Omarchy Calendar Sync Daemon")
+    parser.add_argument("--sync", action="store_true", help="Perform immediate one-shot sync and exit")
+    parser.add_argument("--check-notify", action="store_true", help="Check and trigger pending notifications")
+    parser.add_argument("--daemon", action="store_true", help="Run background resident daemon")
+    parser.add_argument("--status", action="store_true", help="Print current status and upcoming events")
+
+    args = parser.parse_args()
+
+    if args.daemon:
+        run_daemon()
+    elif args.check_notify:
+        check_and_send_notifications()
+    elif args.status:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                print(f"上次同步时间: {data.get('lastSync')}")
+                print(f"同步日历源: {', '.join(data.get('calendars', []))}")
+                print(f"总计事件数: {data.get('total', 0)}")
+                for ev in data.get("events", [])[:5]:
+                    print(f" - [{ev.get('relativeDay')}] {ev.get('displayTime')} {ev.get('summary')} ({ev.get('calendar')})")
+        else:
+            print("暂无缓存数据，运行 omarchy-calendar-sync --sync 进行同步。")
+    else:
+        # Default is --sync
+        print("正在同步在线日历订阅...")
+        res = sync_calendars()
+        check_and_send_notifications()
+        print(f"同步完成！共加载 {res.get('total', 0)} 个日程，已更新缓存。")
+
+if __name__ == "__main__":
+    main()
